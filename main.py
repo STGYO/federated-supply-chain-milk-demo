@@ -12,7 +12,7 @@ import re
 import time
 import random
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -36,6 +36,7 @@ class SCConfig:
     DP_EPSILON: float = 5.0  # Privacy Budget (Lower = More Privacy/Noise)
     DATA_SOURCE_MODE: str = "real"  # "real" or "synthetic"
     DATASET_DIR: str = "DATASETS"
+    CURRENCY: str = "INR"  # Manual fallback currency (used when auto-detection fails)
     
     # Financials (Per Unit)
     SELLING_PRICE: float = 4.0
@@ -45,6 +46,81 @@ class SCConfig:
 
 # Create logs folder if missing
 os.makedirs(SCConfig.LOG_DIR, exist_ok=True)
+
+
+POPULAR_CURRENCY_CODES = [
+    "INR", "USD", "EUR", "GBP", "JPY",
+    "CNY", "AUD", "CAD", "CHF", "SGD"
+]
+
+CURRENCY_NAMES = {
+    "INR": "Indian Rupee",
+    "USD": "US Dollar",
+    "EUR": "Euro",
+    "GBP": "British Pound",
+    "JPY": "Japanese Yen",
+    "CNY": "Chinese Yuan",
+    "AUD": "Australian Dollar",
+    "CAD": "Canadian Dollar",
+    "CHF": "Swiss Franc",
+    "SGD": "Singapore Dollar",
+}
+
+CURRENCY_SYMBOLS = {
+    "INR": "₹",
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "JPY": "¥",
+    "CNY": "¥",
+    "AUD": "A$",
+    "CAD": "C$",
+    "CHF": "CHF",
+    "SGD": "S$",
+}
+
+CURRENCY_DETECTION_PATTERNS = {
+    "INR": [r"\binr\b", r"₹", r"\brupees?\b", r"\brs\.?\b"],
+    "USD": [r"\busd\b", r"\$", r"\bdollars?\b", r"\bus dollars?\b"],
+    "EUR": [r"\beur\b", r"€", r"\beuros?\b"],
+    "GBP": [r"\bgbp\b", r"£", r"\bpounds?\b", r"\bsterling\b"],
+    "JPY": [r"\bjpy\b", r"\byen\b"],
+    "CNY": [r"\bcny\b", r"\byuan\b", r"\brmb\b", r"\brenminbi\b", r"元"],
+    "AUD": [r"\baud\b", r"a\$", r"\baustralian dollars?\b"],
+    "CAD": [r"\bcad\b", r"c\$", r"\bcanadian dollars?\b"],
+    "CHF": [r"\bchf\b", r"\bswiss francs?\b"],
+    "SGD": [r"\bsgd\b", r"s\$", r"\bsingapore dollars?\b"],
+}
+
+INSIGHT_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a tactical supply chain optimization assistant for {product}. "
+    "Focus only on this round's order decision and explain the tradeoff between forecast coverage, "
+    "carbon feasibility, and financial impact. "
+    "Do not provide long-term business expansion advice, staffing advice, or generic market strategy. "
+    "Output exactly 2 to 3 concise sentences."
+)
+
+CHAT_SYSTEM_PROMPT_TEMPLATE = (
+    "You are a helpful supply chain assistant for {product}. "
+    "Keep recommendations tactical and grounded in the current round context when available. "
+    "Avoid unrelated long-term strategy unless the user explicitly asks for it."
+)
+
+STRICT_RETRY_SUFFIX = (
+    "Strict retry: Stay on this round only. Mention at least two of forecast/order/emissions/profit/risk. "
+    "No lists. No generic product portfolio advice. Keep it concise."
+)
+
+OFF_TOPIC_PATTERNS = [
+    r"\bproduct categories\b",
+    r"\bmost profitable products\b",
+    r"\bhiring\b",
+    r"\bworkforce\b",
+    r"\binfrastructure\b",
+    r"\blong[- ]term growth\b",
+    r"\bmarketing strategy\b",
+    r"\bexpand to\b",
+]
 
 
 # =====================================================
@@ -72,6 +148,40 @@ def to_serializable(obj):
     if isinstance(obj, list):
         return [to_serializable(i) for i in obj]
     return obj
+
+
+def normalize_currency_code(code: Optional[str]) -> Optional[str]:
+    if not code:
+        return None
+    value = str(code).strip().upper()
+    return value if value in POPULAR_CURRENCY_CODES else None
+
+
+def detect_currency_from_text(text: str) -> Optional[str]:
+    normalized = str(text).lower()
+    for code in POPULAR_CURRENCY_CODES:
+        patterns = CURRENCY_DETECTION_PATTERNS.get(code, [])
+        for pattern in patterns:
+            if re.search(pattern, normalized):
+                return code
+    return None
+
+
+def detect_currency_in_dataframe(raw_df: pd.DataFrame):
+    for column_name in raw_df.columns:
+        code = detect_currency_from_text(column_name)
+        if code:
+            return code, f"header:{column_name}"
+
+    text_columns = list(raw_df.select_dtypes(include=["object"]).columns)
+    for column_name in text_columns:
+        sample_values = raw_df[column_name].dropna().astype(str).head(25)
+        for value in sample_values:
+            code = detect_currency_from_text(value)
+            if code:
+                return code, f"value:{column_name}"
+
+    return None, None
 
 
 # =====================================================
@@ -102,14 +212,14 @@ def load_model():
     else:
         # CPU or MPS (Apple Silicon) - 4-bit quantization usually requires CUDA
         # We load in float32 (default) or float16 if supported to save memory
-        torch_dtype = torch.float32 
+        model_dtype = torch.float32 
         if device == "mps":
-             torch_dtype = torch.float16
+             model_dtype = torch.float16
 
         model = AutoModelForCausalLM.from_pretrained(
             SCConfig.MODEL_NAME,
             device_map=device,
-            torch_dtype=torch_dtype
+            dtype=model_dtype
         )
 
     tokenizer = AutoTokenizer.from_pretrained(SCConfig.MODEL_NAME)
@@ -118,7 +228,17 @@ def load_model():
     return tokenizer, model
 
 
-def llm_generate(prompt, tokenizer, model, max_tokens=200, temperature=0.7):
+def llm_generate(
+    prompt,
+    tokenizer,
+    model,
+    max_tokens=200,
+    temperature=0.7,
+    top_k=50,
+    top_p=0.9,
+    repetition_penalty=1.1,
+    do_sample=True,
+):
     # Support both raw string prompts and chat messages list
     if isinstance(prompt, str):
         messages = [
@@ -128,28 +248,298 @@ def llm_generate(prompt, tokenizer, model, max_tokens=200, temperature=0.7):
     else:
         messages = prompt
 
-    # Apply Chat Template (handles <|system|>, <|user|>, etc. for TinyLlama)
-    input_ids = tokenizer.apply_chat_template(
-        messages, 
-        return_tensors="pt", 
+    # Apply chat template and normalize to model.generate kwargs.
+    chat_inputs = tokenizer.apply_chat_template(
+        messages,
+        return_tensors="pt",
         add_generation_prompt=True
-    ).to(model.device)
+    )
+
+    if isinstance(chat_inputs, torch.Tensor):
+        model_inputs = {"input_ids": chat_inputs.to(model.device)}
+    elif isinstance(chat_inputs, dict):
+        model_inputs = {
+            k: (v.to(model.device) if hasattr(v, "to") else v)
+            for k, v in chat_inputs.items()
+        }
+    elif hasattr(chat_inputs, "keys"):
+        model_inputs = {
+            k: (chat_inputs[k].to(model.device) if hasattr(chat_inputs[k], "to") else chat_inputs[k])
+            for k in chat_inputs.keys()
+        }
+    else:
+        raise TypeError("Unsupported tokenizer chat template output type")
+
+    prompt_input_ids = model_inputs["input_ids"]
 
     with torch.no_grad():
-        outputs = model.generate(
-            input_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,      
-            do_sample=True,
-            top_k=50,
-            top_p=0.9,
-            repetition_penalty=1.1 # Prevent repetition
-        )
+        generate_kwargs = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "repetition_penalty": repetition_penalty,
+        }
+        if do_sample:
+            generate_kwargs.update({
+                "temperature": temperature,
+                "top_k": top_k,
+                "top_p": top_p,
+            })
+        outputs = model.generate(**model_inputs, **generate_kwargs)
 
     # Decode only the new tokens (response)
     # outputs contains [input_ids + new_tokens]
-    response_ids = outputs[0][input_ids.shape[-1]:]
+    response_ids = outputs[0][prompt_input_ids.shape[-1]:]
     return tokenizer.decode(response_ids, skip_special_tokens=True)
+
+
+def get_generation_profile(mode: str = "chat", strict: bool = False) -> Dict[str, float]:
+    if mode == "insight":
+        if strict:
+            return {
+                "temperature": 0.20,
+                "top_k": 20,
+                "top_p": 0.70,
+                "repetition_penalty": 1.15,
+                "do_sample": True,
+            }
+        return {
+            "temperature": 0.0,
+            "top_k": 0,
+            "top_p": 1.0,
+            "repetition_penalty": 1.08,
+            "do_sample": False,
+        }
+
+    if strict:
+        return {
+            "temperature": 0.30,
+            "top_k": 30,
+            "top_p": 0.80,
+            "repetition_penalty": 1.12,
+            "do_sample": True,
+        }
+    return {
+        "temperature": 0.45,
+        "top_k": 40,
+        "top_p": 0.88,
+        "repetition_penalty": 1.10,
+        "do_sample": True,
+    }
+
+
+def build_round_context(
+    opt_result: Dict[str, Any],
+    forecast: int,
+    currency_code: str,
+    disruption_prob: Optional[float] = None,
+    emission_factor: Optional[float] = None,
+) -> Dict[str, Any]:
+    financials = opt_result.get("financials", {})
+    currency = normalize_currency_code(currency_code) or SCConfig.CURRENCY
+    symbol = CURRENCY_SYMBOLS.get(currency, currency)
+
+    return {
+        "product": SCConfig.PRODUCT_NAME,
+        "currency_code": currency,
+        "currency_symbol": symbol,
+        "forecast": int(forecast),
+        "optimized_qty": int(opt_result.get("optimized_qty", 0)),
+        "safety_stock": int(opt_result.get("safety_stock", 0)),
+        "emissions": float(opt_result.get("emissions", 0.0)),
+        "carbon_cap": float(SCConfig.CARBON_CAP),
+        "feasible": bool(opt_result.get("feasible", False)),
+        "revenue": float(financials.get("revenue", 0.0)),
+        "order_cost": float(financials.get("order_cost", 0.0)),
+        "waste_cost": float(financials.get("waste_cost", 0.0)),
+        "net_profit": float(financials.get("net_profit", 0.0)),
+        "disruption_prob": None if disruption_prob is None else float(disruption_prob),
+        "emission_factor": None if emission_factor is None else float(emission_factor),
+    }
+
+
+def build_insight_messages(context: Dict[str, Any]) -> List[Dict[str, str]]:
+    system_prompt = INSIGHT_SYSTEM_PROMPT_TEMPLATE.format(product=context.get("product", SCConfig.PRODUCT_NAME))
+
+    user_content = (
+        "Current round context:\n"
+        f"- Forecast: {context.get('forecast')} units\n"
+        f"- Recommended order: {context.get('optimized_qty')} units\n"
+        f"- Emissions vs cap: {context.get('emissions'):.2f} / {context.get('carbon_cap'):.2f}\n"
+        f"- Net profit: {context.get('currency_symbol')}{context.get('net_profit'):.2f} {context.get('currency_code')}\n"
+        f"- Disruption risk: {context.get('disruption_prob')}\n"
+        "Give a tactical recommendation for this round only."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def build_chat_messages(user_prompt: str, context: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    system_prompt = CHAT_SYSTEM_PROMPT_TEMPLATE.format(product=SCConfig.PRODUCT_NAME)
+
+    if context:
+        system_prompt = (
+            f"{system_prompt}\n"
+            "Current round context:\n"
+            f"forecast={context.get('forecast')} units, "
+            f"order={context.get('optimized_qty')} units, "
+            f"emissions={context.get('emissions'):.2f}/{context.get('carbon_cap'):.2f}, "
+            f"net_profit={context.get('currency_symbol')}{context.get('net_profit'):.2f} {context.get('currency_code')}, "
+            f"feasible={context.get('feasible')}, "
+            f"disruption_prob={context.get('disruption_prob')}"
+        )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def _sentence_count(text: str) -> int:
+    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    return len(sentences)
+
+
+def validate_tactical_response(text: str, context: Optional[Dict[str, Any]] = None, mode: str = "insight") -> bool:
+    candidate = (text or "").strip()
+    if len(candidate) < 30:
+        return False
+
+    for pattern in OFF_TOPIC_PATTERNS:
+        if re.search(pattern, candidate.lower()):
+            return False
+
+    decision_keywords = ["forecast", "order", "emission", "profit", "waste", "risk", "carbon", "inventory"]
+    matched_keywords = sum(1 for keyword in decision_keywords if keyword in candidate.lower())
+
+    if mode == "insight":
+        if matched_keywords < 1:
+            return False
+        sentence_count = _sentence_count(candidate)
+        if sentence_count < 1 or sentence_count > 4:
+            return False
+    else:
+        if context and matched_keywords < 1:
+            return False
+
+    return True
+
+
+def _apply_strict_retry_constraint(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if not messages:
+        return [{"role": "system", "content": STRICT_RETRY_SUFFIX}]
+
+    strict_messages = [dict(m) for m in messages]
+    if strict_messages[0].get("role") == "system":
+        strict_messages[0]["content"] = f"{strict_messages[0].get('content', '')}\n{STRICT_RETRY_SUFFIX}"
+        return strict_messages
+
+    return [{"role": "system", "content": STRICT_RETRY_SUFFIX}] + strict_messages
+
+
+def build_deterministic_fallback(context: Dict[str, Any]) -> str:
+    symbol = context.get("currency_symbol", "")
+    currency = context.get("currency_code", SCConfig.CURRENCY)
+    feasible_text = "within" if context.get("feasible") else "above"
+    disruption_prob = context.get("disruption_prob")
+    disruption_label = "unknown"
+    if disruption_prob is not None:
+        disruption_label = f"{float(disruption_prob):.2f}"
+
+    return (
+        f"Recommended order is {context.get('optimized_qty')} units against a forecast of {context.get('forecast')} units for this round. "
+        f"Projected net profit is {symbol}{context.get('net_profit', 0.0):.2f} {currency} and emissions are {context.get('emissions', 0.0):.2f}, which is {feasible_text} the carbon cap of {context.get('carbon_cap', 0.0):.2f}. "
+        f"Risk flag: current disruption probability is {disruption_label}, so monitor actual demand and adjust safety stock next round if needed."
+    )
+
+
+def generate_grounded_response(
+    messages: List[Dict[str, str]],
+    tokenizer,
+    model,
+    max_tokens: int = 200,
+    mode: str = "chat",
+    context: Optional[Dict[str, Any]] = None,
+    retry_on_failure: bool = True,
+) -> Dict[str, Any]:
+    profile = get_generation_profile(mode=mode, strict=False)
+    effective_max_tokens = min(max_tokens, 120) if mode == "insight" else max_tokens
+    first_text = llm_generate(
+        messages,
+        tokenizer,
+        model,
+        max_tokens=effective_max_tokens,
+        temperature=profile["temperature"],
+        top_k=int(profile["top_k"]),
+        top_p=profile["top_p"],
+        repetition_penalty=profile["repetition_penalty"],
+        do_sample=bool(profile.get("do_sample", True)),
+    )
+
+    first_valid = validate_tactical_response(first_text, context=context, mode=mode)
+    if first_valid:
+        return {
+            "text": first_text,
+            "valid": first_valid,
+            "used_retry": False,
+            "used_fallback": False,
+        }
+
+    if not retry_on_failure:
+        if context and mode == "insight":
+            fallback_text = build_deterministic_fallback(context)
+            return {
+                "text": fallback_text,
+                "valid": True,
+                "used_retry": False,
+                "used_fallback": True,
+            }
+        return {
+            "text": first_text,
+            "valid": False,
+            "used_retry": False,
+            "used_fallback": False,
+        }
+
+    strict_messages = _apply_strict_retry_constraint(messages)
+    strict_profile = get_generation_profile(mode=mode, strict=True)
+    second_text = llm_generate(
+        strict_messages,
+        tokenizer,
+        model,
+        max_tokens=effective_max_tokens,
+        temperature=strict_profile["temperature"],
+        top_k=int(strict_profile["top_k"]),
+        top_p=strict_profile["top_p"],
+        repetition_penalty=strict_profile["repetition_penalty"],
+        do_sample=bool(strict_profile.get("do_sample", True)),
+    )
+    second_valid = validate_tactical_response(second_text, context=context, mode=mode)
+    if second_valid:
+        return {
+            "text": second_text,
+            "valid": True,
+            "used_retry": True,
+            "used_fallback": False,
+        }
+
+    if context and mode == "insight":
+        fallback_text = build_deterministic_fallback(context)
+        return {
+            "text": fallback_text,
+            "valid": True,
+            "used_retry": True,
+            "used_fallback": True,
+        }
+
+    return {
+        "text": second_text,
+        "valid": False,
+        "used_retry": True,
+        "used_fallback": False,
+    }
 
 
 # =====================================================
@@ -174,12 +564,25 @@ class DifferentialPrivacy:
 # Synthetic Data
 # =====================================================
 class SupplyChainDataManager:
-    def __init__(self, num_clients: int, weeks: int = 52, data_mode: str = "synthetic", dataset_dir: Optional[str] = None):
+    def __init__(
+        self,
+        num_clients: int,
+        weeks: int = 52,
+        data_mode: str = "synthetic",
+        dataset_dir: Optional[str] = None,
+        manual_currency: Optional[str] = None,
+    ):
         self.num_clients = num_clients
         self.weeks = weeks
         self.data_mode = data_mode.lower()
         self.dataset_dir = dataset_dir or SCConfig.DATASET_DIR
+        self.manual_currency = normalize_currency_code(manual_currency) or SCConfig.CURRENCY
         self.client_data = {}
+        self.detected_currency = None
+        self.currency_source = "manual"
+        self.mixed_currency_detected = False
+        self.currency_detection_details: Dict[str, Dict[str, str]] = {}
+        self.effective_currency = self.manual_currency
 
         if self.data_mode == "real":
             loaded = self.load_real_data()
@@ -188,6 +591,8 @@ class SupplyChainDataManager:
                 self.generate_data(start_cid=loaded)
         else:
             self.generate_data()
+
+        self._set_effective_currency()
 
     def generate_data(self, start_cid: int = 0):
         np.random.seed(42 + start_cid)
@@ -212,6 +617,7 @@ class SupplyChainDataManager:
     def load_real_data(self) -> int:
         if not os.path.isdir(self.dataset_dir):
             log(f"Dataset directory '{self.dataset_dir}' not found. Falling back to synthetic data.")
+            self._set_effective_currency()
             return 0
 
         csv_files = sorted([
@@ -221,6 +627,7 @@ class SupplyChainDataManager:
 
         if not csv_files:
             log(f"No client CSV files found in '{self.dataset_dir}'. Falling back to synthetic data.")
+            self._set_effective_currency()
             return 0
 
         loaded_clients = 0
@@ -228,6 +635,16 @@ class SupplyChainDataManager:
             file_path = os.path.join(self.dataset_dir, file_name)
             try:
                 raw_df = pd.read_csv(file_path)
+                detected_currency, detection_source = detect_currency_in_dataframe(raw_df)
+                if detected_currency:
+                    self.currency_detection_details[file_name] = {
+                        "currency": detected_currency,
+                        "source": detection_source or "unknown"
+                    }
+                    if self.detected_currency is None:
+                        self.detected_currency = detected_currency
+                    elif self.detected_currency != detected_currency:
+                        self.mixed_currency_detected = True
                 prepared_df = self._prepare_client_dataframe(raw_df, cid)
                 self.client_data[str(cid)] = prepared_df
                 loaded_clients += 1
@@ -235,7 +652,29 @@ class SupplyChainDataManager:
             except Exception as e:
                 log(f"Failed to load {file_name}: {e}")
 
+        self._set_effective_currency()
+
         return loaded_clients
+
+    def _set_effective_currency(self):
+        if self.detected_currency:
+            self.effective_currency = self.detected_currency
+            self.currency_source = "auto-detected"
+        else:
+            self.effective_currency = self.manual_currency
+            self.currency_source = "manual"
+
+    def get_effective_currency(self) -> str:
+        return self.effective_currency
+
+    def get_effective_currency_symbol(self) -> str:
+        return CURRENCY_SYMBOLS.get(self.effective_currency, self.effective_currency)
+
+    def is_currency_auto_detected(self) -> bool:
+        return self.currency_source == "auto-detected"
+
+    def has_mixed_currency(self) -> bool:
+        return self.mixed_currency_detected
 
     def _prepare_client_dataframe(self, raw_df: pd.DataFrame, cid: int) -> pd.DataFrame:
         columns = {c.lower().strip(): c for c in raw_df.columns}
