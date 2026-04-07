@@ -74,6 +74,8 @@ num_clients = st.sidebar.slider("Number of Clients", 1, 10, SCConfig.NUM_CLIENTS
 num_rounds = st.sidebar.slider("Federated Rounds", 1, 10, SCConfig.NUM_ROUNDS)
 carbon_cap = st.sidebar.number_input("Carbon Cap", value=SCConfig.CARBON_CAP)
 dp_epsilon = st.sidebar.slider("DP Epsilon (Privacy Budget)", 0.1, 20.0, SCConfig.DP_EPSILON, help="Lower = More Noise/Privacy")
+data_source_mode = st.sidebar.selectbox("Data Source", ["real", "synthetic"], index=0 if SCConfig.DATA_SOURCE_MODE == "real" else 1)
+dataset_dir = st.sidebar.text_input("Dataset Directory", SCConfig.DATASET_DIR)
 log_dir = st.sidebar.text_input("Log Directory", SCConfig.LOG_DIR)
 
 
@@ -83,6 +85,8 @@ SCConfig.NUM_ROUNDS = num_rounds
 SCConfig.CARBON_CAP = carbon_cap
 SCConfig.LOG_DIR = log_dir
 SCConfig.DP_EPSILON = dp_epsilon
+SCConfig.DATA_SOURCE_MODE = data_source_mode
+SCConfig.DATASET_DIR = dataset_dir
 
 # Initialize Session State
 if "model" not in st.session_state:
@@ -99,6 +103,10 @@ if "metrics" not in st.session_state:
     st.session_state.metrics = None
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "data_manager" not in st.session_state:
+    st.session_state.data_manager = None
+if "client0_max" not in st.session_state:
+    st.session_state.client0_max = None
 
 # Main Layout: 2 Columns
 # split into [Left: Simulation/Results, Right: Chat Assistant]
@@ -142,8 +150,13 @@ with main_col:
             status_text = st.empty()
             
             # 1. Initialize Data (Only if not already active? No, re-run means fresh data/round)
-            status_text.text("Generating synthetic data...")
-            data_manager = SupplyChainDataManager(SCConfig.NUM_CLIENTS)
+            status_text.text(f"Loading {SCConfig.DATA_SOURCE_MODE} client data...")
+            data_manager = SupplyChainDataManager(
+                SCConfig.NUM_CLIENTS,
+                data_mode=SCConfig.DATA_SOURCE_MODE,
+                dataset_dir=SCConfig.DATASET_DIR
+            )
+            st.session_state.data_manager = data_manager
             progress_bar.progress(20)
             
             # 2. Run FedSim
@@ -160,7 +173,8 @@ with main_col:
             
             # Prepare input for LSTM (Last 5 weeks)
             data = client0_df["demand"].values.astype(np.float32)
-            max_val = 300.0
+            max_val = fed.max_vals.get("0", float(np.max(data)) if np.max(data) > 0 else 1.0)
+            st.session_state.client0_max = max_val
             last_seq = data[-5:] / max_val
             inp = torch.tensor(last_seq).unsqueeze(0).unsqueeze(-1)
             
@@ -200,6 +214,7 @@ with main_col:
     if st.session_state.simulation_done and st.session_state.opt_result:
         st.divider()
         st.header("Results & Recommendation")
+        data_manager = st.session_state.get("data_manager")
         
         opt = st.session_state.opt_result
         forecast = st.session_state.forecast
@@ -226,6 +241,14 @@ with main_col:
 
         # Historical Trend Visualization
         st.subheader("Historical Demand & Forecast")
+        if data_manager is None:
+            data_manager = SupplyChainDataManager(
+                SCConfig.NUM_CLIENTS,
+                data_mode=SCConfig.DATA_SOURCE_MODE,
+                dataset_dir=SCConfig.DATASET_DIR
+            )
+            st.session_state.data_manager = data_manager
+
         client0_df = data_manager.get_client_data("0")
         
         # Get last 20 weeks for better visibility (or full history)
@@ -239,7 +262,10 @@ with main_col:
         # We need to structure it for the chart
         # Let's use a simple line chart with the forecast appended
         
-        chart_data = history_df[["week", "demand"]].set_index("week")
+        if "date" in history_df.columns and history_df["date"].notna().any():
+            chart_data = history_df[["date", "demand"]].set_index("date")
+        else:
+            chart_data = history_df[["week", "demand"]].set_index("week")
         
         # Add Forecast row
         # We can't easily mix types in simple st.line_chart, so we plot history 

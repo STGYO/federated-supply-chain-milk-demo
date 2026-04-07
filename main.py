@@ -12,7 +12,7 @@ import re
 import time
 import random
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,6 +34,8 @@ class SCConfig:
     CARBON_CAP: float = 500.0  # Adjusted for Milk (e.g. per batch)
     LOG_DIR: str = "sc50_logs"
     DP_EPSILON: float = 5.0  # Privacy Budget (Lower = More Privacy/Noise)
+    DATA_SOURCE_MODE: str = "real"  # "real" or "synthetic"
+    DATASET_DIR: str = "DATASETS"
     
     # Financials (Per Unit)
     SELLING_PRICE: float = 4.0
@@ -172,15 +174,24 @@ class DifferentialPrivacy:
 # Synthetic Data
 # =====================================================
 class SupplyChainDataManager:
-    def __init__(self, num_clients: int, weeks: int = 52):
+    def __init__(self, num_clients: int, weeks: int = 52, data_mode: str = "synthetic", dataset_dir: Optional[str] = None):
         self.num_clients = num_clients
         self.weeks = weeks
+        self.data_mode = data_mode.lower()
+        self.dataset_dir = dataset_dir or SCConfig.DATASET_DIR
         self.client_data = {}
-        self.generate_data()
 
-    def generate_data(self):
-        np.random.seed(42)
-        for cid in range(self.num_clients):
+        if self.data_mode == "real":
+            loaded = self.load_real_data()
+            if loaded < self.num_clients:
+                log(f"Only {loaded} client CSV files found. Filling remaining clients with synthetic data.")
+                self.generate_data(start_cid=loaded)
+        else:
+            self.generate_data()
+
+    def generate_data(self, start_cid: int = 0):
+        np.random.seed(42 + start_cid)
+        for cid in range(start_cid, self.num_clients):
             t = np.arange(self.weeks)
             trend = 100 + (t * 0.5)
             seasonality = 20 * np.sin(2 * np.pi * t / 12)
@@ -197,6 +208,84 @@ class SupplyChainDataManager:
                 "disruption_prob": disruption_prob,
                 "emission_factor": emission_factor
             })
+
+    def load_real_data(self) -> int:
+        if not os.path.isdir(self.dataset_dir):
+            log(f"Dataset directory '{self.dataset_dir}' not found. Falling back to synthetic data.")
+            return 0
+
+        csv_files = sorted([
+            f for f in os.listdir(self.dataset_dir)
+            if f.lower().startswith("client_") and f.lower().endswith(".csv")
+        ])
+
+        if not csv_files:
+            log(f"No client CSV files found in '{self.dataset_dir}'. Falling back to synthetic data.")
+            return 0
+
+        loaded_clients = 0
+        for cid, file_name in enumerate(csv_files[:self.num_clients]):
+            file_path = os.path.join(self.dataset_dir, file_name)
+            try:
+                raw_df = pd.read_csv(file_path)
+                prepared_df = self._prepare_client_dataframe(raw_df, cid)
+                self.client_data[str(cid)] = prepared_df
+                loaded_clients += 1
+                log(f"Loaded real client data: {file_name} ({len(prepared_df)} rows)")
+            except Exception as e:
+                log(f"Failed to load {file_name}: {e}")
+
+        return loaded_clients
+
+    def _prepare_client_dataframe(self, raw_df: pd.DataFrame, cid: int) -> pd.DataFrame:
+        columns = {c.lower().strip(): c for c in raw_df.columns}
+
+        def find_col(candidates):
+            for c in candidates:
+                if c in columns:
+                    return columns[c]
+            return None
+
+        demand_col = find_col(["demand", "quantity_sold", "sales", "units_sold"]) 
+        if demand_col is None:
+            raise ValueError("No demand-like column found in client dataset")
+
+        week_col = find_col(["week"])
+        date_col = find_col(["date", "timestamp"])
+        disruption_col = find_col(["disruption_prob", "disruption_probability", "risk"])
+        emission_col = find_col(["emission_factor", "carbon_factor", "co2e_factor"])
+
+        out = pd.DataFrame()
+        if week_col is not None:
+            out["week"] = pd.to_numeric(raw_df[week_col], errors="coerce")
+        else:
+            out["week"] = np.arange(len(raw_df))
+
+        if date_col is not None:
+            out["date"] = pd.to_datetime(raw_df[date_col], errors="coerce")
+
+        out["demand"] = pd.to_numeric(raw_df[demand_col], errors="coerce")
+
+        if disruption_col is not None:
+            out["disruption_prob"] = pd.to_numeric(raw_df[disruption_col], errors="coerce")
+        else:
+            demand_volatility = out["demand"].pct_change().abs().fillna(0.0)
+            out["disruption_prob"] = np.clip(0.06 + demand_volatility * 0.8, 0.01, 0.60)
+
+        if emission_col is not None:
+            out["emission_factor"] = pd.to_numeric(raw_df[emission_col], errors="coerce")
+        else:
+            base = 1.20 + (0.20 * cid)
+            out["emission_factor"] = np.random.normal(base, 0.08, len(out))
+
+        out = out.dropna(subset=["demand"]).reset_index(drop=True)
+        out["week"] = out["week"].fillna(pd.Series(np.arange(len(out)))).astype(int)
+        out["demand"] = out["demand"].clip(lower=0).astype(int)
+        out["disruption_prob"] = out["disruption_prob"].fillna(out["disruption_prob"].median()).clip(0, 1)
+        out["emission_factor"] = out["emission_factor"].fillna(out["emission_factor"].median()).clip(lower=0.1)
+
+        out = out.sort_values("week").reset_index(drop=True)
+        return out
 
     def get_client_data(self, cid: str):
         return self.client_data[str(cid)]
@@ -238,6 +327,7 @@ class FedSim:
         self.data_manager = data_manager
         self.input_size = 1
         self.sequence_length = 5
+        self.max_vals = {}
         # Initialize Global Model
         self.global_model = LSTMModel(input_size=self.input_size)
         self.metrics = {"rounds": [], "mae": [], "rmse": [], "loss": []}
@@ -255,10 +345,13 @@ class FedSim:
         # Prepare Data
         df = self.data_manager.get_client_data(str(cid))
         data = df["demand"].values.astype(np.float32)
+        if len(data) <= self.sequence_length:
+            raise ValueError(f"Client {cid} does not have enough data points for sequence length {self.sequence_length}")
         
         # Normalize Data (Simple MinMax for stability, ideally learned globally but approximating here)
-        self.max_val = 300.0 # Approximate max demand
-        data_norm = data / self.max_val
+        max_val = float(np.max(data)) if np.max(data) > 0 else 1.0
+        self.max_vals[str(cid)] = max_val
+        data_norm = data / max_val
 
         # Create Sequences
         X, y = [], []
@@ -324,14 +417,15 @@ class FedSim:
                 for cid in range(SCConfig.NUM_CLIENTS):
                     df = self.data_manager.get_client_data(str(cid))
                     data = df["demand"].values.astype(np.float32)
+                    max_val = self.max_vals.get(str(cid), float(np.max(data)) if np.max(data) > 0 else 1.0)
                     
                     # Predict last week using previous sequence
-                    last_seq = data[-self.sequence_length-1:-1] / self.max_val
+                    last_seq = data[-self.sequence_length-1:-1] / max_val
                     true_val = data[-1]
                     
                     inp = torch.tensor(last_seq).unsqueeze(0).unsqueeze(-1)
                     pred_norm = self.global_model(inp).item()
-                    pred = int(pred_norm * self.max_val)
+                    pred = int(pred_norm * max_val)
                     
                     err = abs(true_val - pred)
                     total_mae += err
@@ -406,7 +500,11 @@ def main():
     # Load LLM for Explanation only
     tokenizer, model = load_model()
 
-    data_manager = SupplyChainDataManager(SCConfig.NUM_CLIENTS)
+    data_manager = SupplyChainDataManager(
+        SCConfig.NUM_CLIENTS,
+        data_mode=SCConfig.DATA_SOURCE_MODE,
+        dataset_dir=SCConfig.DATASET_DIR
+    )
 
     # Federated LSTM Training
     fed = FedSim(data_manager)
@@ -415,7 +513,7 @@ def main():
     # FINAL FORECAST (Using trained LSTM)
     client0_df = data_manager.get_client_data("0")
     data = client0_df["demand"].values.astype(np.float32)
-    max_val = 300.0 # Same normalization constant as in training
+    max_val = fed.max_vals.get("0", float(np.max(data)) if np.max(data) > 0 else 1.0)
     
     # Get last 5 weeks
     last_seq = data[-5:] / max_val

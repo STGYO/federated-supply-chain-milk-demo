@@ -1,37 +1,59 @@
 # Federated Learning for Supply Chain Optimization (Milk)
 
 ## Overview
-This project simulates a **Federated Learning (FL)** system to optimize the supply chain for a perishable product ("Milk"). It predicts future demand using a distributed **LSTM (Long Short-Term Memory)** neural network, ensuring data privacy by keeping raw data on local clients and only sharing model updates.
+
+This project simulates a Federated Learning (FL) system to optimize the supply chain for a perishable product (Milk). It predicts future demand using a distributed LSTM (Long Short-Term Memory) model, keeping raw data local to each client and sharing only model updates.
 
 ## System Architecture
+
 How the system works:
-1.  **Local Training**: Each client (Retail, Warehouse, Logistics) trains a local LSTM model on their private sales data.
-2.  **Federated Averaging**: Clients send their model weights (not data!) to the central server.
-3.  **Aggregation**: The server averages these weights to create a "Global Model" that is smarter than any single client.
-4.  **Privacy**: Differential Privacy noise is added to the weights to prevent reverse-engineering.
-5.  **Optimization**: The global forecast is used to calculate the optimal order quantity, balancing profit, waste, and carbon emissions.
+
+1. Local training: Each client trains a local LSTM model on private sales data.
+2. Federated averaging: Clients send model weights (not raw data) to the server.
+3. Aggregation: The server averages weights into a global model.
+4. Privacy: Differential privacy noise is added to model updates.
+5. Optimization: The forecast drives order quantity decisions while balancing profit, waste, and emissions.
 
 ![System Architecture](architecture.png)
 
 ## Key Features
--   **Federated LSTM**: Time-series forecasting without sharing raw data.
--   **Differential Privacy**: Laplacian noise added to gradients for security.
--   **Optimization Engine**: Balances Inventory vs. Spoilage vs. Carbon Cap.
--   **Interactive Dashboard**: Streamlit UI for real-time simulation and "What-If" analysis.
 
-## Setup & Run
+- Federated LSTM forecasting without sharing raw client data.
+- Differential privacy noise injection for extra protection.
+- Optimization logic for inventory, spoilage, and carbon-cap feasibility.
+- Streamlit dashboard for simulation, charts, and what-if analysis.
 
-1.  **Install Dependencies**:
-    ```bash
-    pip install -r requirements.txt
-    ```
+## Setup and Run
 
-2.  **Run the Simulation**:
-    ```bash
-    streamlit run app.py
-    ```
+1. Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+1. Start the dashboard:
+
+```bash
+streamlit run app.py
+```
+
+## Real Data Mode (Implemented)
+
+- Place client CSV files inside DATASETS.
+- Example file names: client_1_amul_gujarat.csv, client_2_mother_dairy_delhi.csv, client_3_sudha_bihar.csv.
+- In the Streamlit sidebar, set Data Source to real.
+- In the Streamlit sidebar, set Dataset Directory to DATASETS.
+
+The app now loads real client data directly from CSV and uses:
+
+- demand as the forecasting target.
+- disruption_prob for safety-stock risk logic.
+- emission_factor for carbon-impact checks.
+
+If fewer client CSV files are found than the selected client count, remaining clients are automatically backfilled with synthetic data.
 
 ## Project Structure
--   `main.py`: Core logic for FedSim, LSTMModel, and Optimization.
--   `app.py`: Streamlit Dashboard implementation.
--   `requirements.txt`: Python dependencies.
+
+- main.py: Core logic for federated training, data management, and optimization.
+- app.py: Streamlit dashboard.
+- requirements.txt: Python dependencies.
